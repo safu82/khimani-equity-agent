@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+anthropic
+supabase
+requests
+python-telegram-bot==20.7
+httpx
+numpy

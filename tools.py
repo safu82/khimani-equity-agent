@@ -1001,7 +1001,6 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
-,
     {
         "name": "get_portfolio_ath",
         "description": (

@@ -693,13 +693,13 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
 # ─────────────────────────────────────────────────────────────────
 def get_portfolio_ath() -> str:
     """
-    Analyse portfolio snapshots from Jan 2023 to find:
-    - All-time high value and when it occurred
-    - Current drawdown from ATH
-    - Best and worst months by absolute gain
-    - Cumulative gain since Jan 2023 baseline
+    Compute cumulative profit gains (not portfolio value) from Jan 2023.
+    Monthly gain = endValue - startValue + withdrawals - deposits
+    ATH = peak cumulative gain, not peak portfolio value.
+    Uses SQL aggregation for cash_flows to handle 20,000+ rows efficiently.
     """
     try:
+        # 1. Get all monthly snapshots from Jan 2023
         snapshots = sb.table("portfolio_snapshots") \
                       .select("snapshot_date, total_value") \
                       .eq("portfolio", PORTFOLIO) \
@@ -707,10 +707,81 @@ def get_portfolio_ath() -> str:
                       .order("snapshot_date") \
                       .execute().data
 
-        if not snapshots:
-            return json.dumps({"error": "No snapshots found"})
+        if len(snapshots) < 2:
+            return json.dumps({"error": "Not enough snapshots found"})
 
-        # Current portfolio value from live prices
+        # 2. Aggregate cash_flows by month (server-side — handles 20k+ rows)
+        # withdrawals = positive amounts (sells), deposits = negative amounts (buys)
+        cf_agg_raw = sb.rpc("get_monthly_cashflows", {
+            "p_portfolio": PORTFOLIO,
+            "p_from_date": "2023-01-01",
+        }).execute().data
+
+        # Fall back to manual aggregation if RPC not available
+        if cf_agg_raw is None:
+            cf_agg_raw = []
+
+        # Build month → {withdrawals, deposits} lookup
+        cf_by_month: dict = {}
+        for row in cf_agg_raw:
+            month_key = str(row["month"])[:7]  # YYYY-MM
+            cf_by_month[month_key] = {
+                "withdrawals": float(row.get("withdrawals") or 0),
+                "deposits":    float(row.get("deposits") or 0),
+            }
+
+        # 3. Get Oct 2025+ transactions (BUY=deposit, SELL=withdrawal)
+        CASH_FLOWS_END_DATE = "2025-10-01"
+        txns = sb.table("transactions") \
+                 .select("date, type, quantity, price") \
+                 .eq("portfolio", PORTFOLIO) \
+                 .gte("date", CASH_FLOWS_END_DATE) \
+                 .order("date") \
+                 .execute().data
+
+        # Aggregate transactions by month
+        for t in txns:
+            month_key = t["date"][:7]
+            value     = float(t["quantity"]) * float(t["price"])
+            if month_key not in cf_by_month:
+                cf_by_month[month_key] = {"withdrawals": 0, "deposits": 0}
+            if t["type"] == "SELL":
+                cf_by_month[month_key]["withdrawals"] += value
+            else:
+                cf_by_month[month_key]["deposits"] += value
+
+        # 4. Compute monthly gains and cumulative gains
+        # gain = endValue - startValue + withdrawals - deposits
+        monthly_gains  = []
+        cumulative     = 0.0
+        ath_cumulative = 0.0
+        ath_date       = snapshots[0]["snapshot_date"]
+
+        snap_by_date = {s["snapshot_date"]: float(s["total_value"]) for s in snapshots}
+        snap_dates   = sorted(snap_by_date.keys())
+
+        for i in range(1, len(snap_dates)):
+            prev_date = snap_dates[i - 1]
+            curr_date = snap_dates[i]
+            prev_val  = snap_by_date[prev_date]
+            curr_val  = snap_by_date[curr_date]
+            month_key = curr_date[:7]
+
+            cf        = cf_by_month.get(month_key, {"withdrawals": 0, "deposits": 0})
+            gain      = curr_val - prev_val + cf["withdrawals"] - cf["deposits"]
+            cumulative += gain
+
+            if cumulative > ath_cumulative:
+                ath_cumulative = cumulative
+                ath_date       = curr_date
+
+            monthly_gains.append({
+                "date":        curr_date,
+                "gain":        round(gain, 2),
+                "cumulative":  round(cumulative, 2),
+            })
+
+        # 5. Add current month (live value vs last snapshot)
         holdings = sb.table("holdings") \
                      .select("ticker, quantity, avg_cost") \
                      .eq("portfolio", PORTFOLIO) \
@@ -724,57 +795,35 @@ def get_portfolio_ath() -> str:
 
         prices = {p["ticker"]: float(p.get("price") or 0) for p in prices_raw}
 
-        current_value = sum(
+        current_value  = sum(
             float(h["quantity"]) * prices.get(h["ticker"], float(h["avg_cost"]))
             for h in holdings
         )
+        last_snap_val  = snap_by_date[snap_dates[-1]]
+        today_str      = date.today().isoformat()
+        today_month    = today_str[:7]
+        cf_today       = cf_by_month.get(today_month, {"withdrawals": 0, "deposits": 0})
+        current_gain   = current_value - last_snap_val + cf_today["withdrawals"] - cf_today["deposits"]
+        cumulative_now = cumulative + current_gain
 
-        baseline    = float(snapshots[0]["total_value"])
-        baseline_dt = snapshots[0]["snapshot_date"]
+        if cumulative_now > ath_cumulative:
+            ath_cumulative = cumulative_now
+            ath_date       = today_str
 
-        # Find ATH across all snapshots + current value
-        ath_value = baseline
-        ath_date  = baseline_dt
+        drawdown_from_ath = cumulative_now - ath_cumulative
+        drawdown_pct      = (drawdown_from_ath / ath_cumulative * 100) if ath_cumulative else 0
 
-        monthly_gains = []
-        for i in range(1, len(snapshots)):
-            prev  = float(snapshots[i - 1]["total_value"])
-            curr  = float(snapshots[i]["total_value"])
-            gain  = curr - prev
-            monthly_gains.append({
-                "date":  snapshots[i]["snapshot_date"],
-                "value": round(curr, 2),
-                "gain":  round(gain, 2),
-            })
-            if curr > ath_value:
-                ath_value = curr
-                ath_date  = snapshots[i]["snapshot_date"]
-
-        # Check if current value is a new ATH
-        if current_value > ath_value:
-            ath_value = current_value
-            ath_date  = date.today().isoformat()
-
-        drawdown        = current_value - ath_value
-        drawdown_pct    = (drawdown / ath_value * 100) if ath_value else 0
-        cumulative_gain = current_value - baseline
-        cumulative_pct  = (cumulative_gain / baseline * 100) if baseline else 0
-
-        monthly_gains_sorted = sorted(monthly_gains, key=lambda x: x["gain"], reverse=True)
+        gains_sorted = sorted(monthly_gains, key=lambda x: x["gain"], reverse=True)
 
         return json.dumps({
-            "baseline_value":   round(baseline, 2),
-            "baseline_date":    baseline_dt,
-            "ath_value":        round(ath_value, 2),
-            "ath_date":         ath_date,
-            "current_value":    round(current_value, 2),
-            "drawdown":         round(drawdown, 2),
-            "drawdown_pct":     round(drawdown_pct, 2),
-            "cumulative_gain":  round(cumulative_gain, 2),
-            "cumulative_pct":   round(cumulative_pct, 2),
-            "best_month":       monthly_gains_sorted[0]  if monthly_gains_sorted else None,
-            "worst_month":      monthly_gains_sorted[-1] if monthly_gains_sorted else None,
-            "total_snapshots":  len(snapshots),
+            "ath_cumulative_gain": round(ath_cumulative, 2),
+            "ath_date":            ath_date,
+            "current_cumulative":  round(cumulative_now, 2),
+            "drawdown_from_ath":   round(drawdown_from_ath, 2),
+            "drawdown_pct":        round(drawdown_pct, 2),
+            "best_month":          gains_sorted[0]  if gains_sorted else None,
+            "worst_month":         gains_sorted[-1] if gains_sorted else None,
+            "total_months":        len(monthly_gains),
         })
 
     except Exception as e:
@@ -800,11 +849,17 @@ def get_technical_overview(filter: str = "all") -> str:
         tickers    = [h["ticker"] for h in holdings]
         ticker_map = {h["ticker"]: h["name"] for h in holdings}
 
+        # stock_ema_values uses tickers without .NS suffix — strip it
+        stripped_tickers = [t.replace(".NS", "").replace(".BO", "") for t in tickers]
+
         # Get EMA data for holdings
         ema_raw = sb.table("stock_ema_values") \
                     .select("ticker, stock_name, current_price, ema_20, ema_50, ema_200, is_stacked, is_bearish_stacked") \
-                    .in_("ticker", tickers) \
+                    .in_("ticker", stripped_tickers) \
                     .execute().data
+
+        # Build reverse map: stripped ticker → original ticker
+        strip_map = {t.replace(".NS", "").replace(".BO", ""): t for t in tickers}
 
         if not ema_raw:
             return json.dumps({"error": "No EMA data found for holdings"})
@@ -831,7 +886,7 @@ def get_technical_overview(filter: str = "all") -> str:
 
             result.append({
                 "ticker":        e["ticker"],
-                "name":          ticker_map.get(e["ticker"], e.get("stock_name", "")),
+                "name":          ticker_map.get(strip_map.get(e["ticker"], e["ticker"]), e.get("stock_name", "")),
                 "current_price": round(price, 2),
                 "ema_20":        round(ema_20, 2)  if ema_20  else None,
                 "ema_50":        round(ema_50, 2)  if ema_50  else None,

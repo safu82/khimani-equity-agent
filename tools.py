@@ -687,6 +687,186 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
 
 
 
+
+# ─────────────────────────────────────────────────────────────────
+# TOOL 9: get_portfolio_ath
+# ─────────────────────────────────────────────────────────────────
+def get_portfolio_ath() -> str:
+    """
+    Analyse portfolio snapshots from Jan 2023 to find:
+    - All-time high value and when it occurred
+    - Current drawdown from ATH
+    - Best and worst months by absolute gain
+    - Cumulative gain since Jan 2023 baseline
+    """
+    try:
+        snapshots = sb.table("portfolio_snapshots") \
+                      .select("snapshot_date, total_value") \
+                      .eq("portfolio", PORTFOLIO) \
+                      .gte("snapshot_date", "2023-01-01") \
+                      .order("snapshot_date") \
+                      .execute().data
+
+        if not snapshots:
+            return json.dumps({"error": "No snapshots found"})
+
+        # Current portfolio value from live prices
+        holdings = sb.table("holdings") \
+                     .select("ticker, quantity, avg_cost") \
+                     .eq("portfolio", PORTFOLIO) \
+                     .execute().data
+
+        tickers    = [h["ticker"] for h in holdings]
+        prices_raw = sb.table("live_prices") \
+                       .select("ticker, price") \
+                       .in_("ticker", tickers) \
+                       .execute().data
+
+        prices = {p["ticker"]: float(p.get("price") or 0) for p in prices_raw}
+
+        current_value = sum(
+            float(h["quantity"]) * prices.get(h["ticker"], float(h["avg_cost"]))
+            for h in holdings
+        )
+
+        baseline    = float(snapshots[0]["total_value"])
+        baseline_dt = snapshots[0]["snapshot_date"]
+
+        # Find ATH across all snapshots + current value
+        ath_value = baseline
+        ath_date  = baseline_dt
+
+        monthly_gains = []
+        for i in range(1, len(snapshots)):
+            prev  = float(snapshots[i - 1]["total_value"])
+            curr  = float(snapshots[i]["total_value"])
+            gain  = curr - prev
+            monthly_gains.append({
+                "date":  snapshots[i]["snapshot_date"],
+                "value": round(curr, 2),
+                "gain":  round(gain, 2),
+            })
+            if curr > ath_value:
+                ath_value = curr
+                ath_date  = snapshots[i]["snapshot_date"]
+
+        # Check if current value is a new ATH
+        if current_value > ath_value:
+            ath_value = current_value
+            ath_date  = date.today().isoformat()
+
+        drawdown        = current_value - ath_value
+        drawdown_pct    = (drawdown / ath_value * 100) if ath_value else 0
+        cumulative_gain = current_value - baseline
+        cumulative_pct  = (cumulative_gain / baseline * 100) if baseline else 0
+
+        monthly_gains_sorted = sorted(monthly_gains, key=lambda x: x["gain"], reverse=True)
+
+        return json.dumps({
+            "baseline_value":   round(baseline, 2),
+            "baseline_date":    baseline_dt,
+            "ath_value":        round(ath_value, 2),
+            "ath_date":         ath_date,
+            "current_value":    round(current_value, 2),
+            "drawdown":         round(drawdown, 2),
+            "drawdown_pct":     round(drawdown_pct, 2),
+            "cumulative_gain":  round(cumulative_gain, 2),
+            "cumulative_pct":   round(cumulative_pct, 2),
+            "best_month":       monthly_gains_sorted[0]  if monthly_gains_sorted else None,
+            "worst_month":      monthly_gains_sorted[-1] if monthly_gains_sorted else None,
+            "total_snapshots":  len(snapshots),
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────
+# TOOL 10: get_technical_overview
+# ─────────────────────────────────────────────────────────────────
+def get_technical_overview(filter: str = "all") -> str:
+    """
+    EMA position and stack analysis for holdings.
+    Queries stock_ema_values filtered to Indian portfolio holdings.
+    filter: 'all', 'above_200', 'below_200', 'bullish_stack', 'bearish_stack'
+    """
+    try:
+        # Get holding tickers
+        holdings = sb.table("holdings") \
+                     .select("ticker, name") \
+                     .eq("portfolio", PORTFOLIO) \
+                     .execute().data
+
+        tickers    = [h["ticker"] for h in holdings]
+        ticker_map = {h["ticker"]: h["name"] for h in holdings}
+
+        # Get EMA data for holdings
+        ema_raw = sb.table("stock_ema_values") \
+                    .select("ticker, stock_name, current_price, ema_20, ema_50, ema_200, is_stacked, is_bearish_stacked") \
+                    .in_("ticker", tickers) \
+                    .execute().data
+
+        if not ema_raw:
+            return json.dumps({"error": "No EMA data found for holdings"})
+
+        # Enrich and filter
+        result = []
+        for e in ema_raw:
+            price   = float(e.get("current_price") or 0)
+            ema_200 = float(e.get("ema_200") or 0)
+            ema_50  = float(e.get("ema_50") or 0)
+            ema_20  = float(e.get("ema_20") or 0)
+
+            above_200     = price > ema_200 if ema_200 else None
+            bullish_stack = e.get("is_stacked") or False
+            bearish_stack = e.get("is_bearish_stacked") or False
+
+            # Apply filter
+            if filter == "above_200"    and not above_200:      continue
+            if filter == "below_200"    and above_200 is not False: continue
+            if filter == "bullish_stack" and not bullish_stack: continue
+            if filter == "bearish_stack" and not bearish_stack: continue
+
+            dist_200 = ((price - ema_200) / ema_200 * 100) if ema_200 else None
+
+            result.append({
+                "ticker":        e["ticker"],
+                "name":          ticker_map.get(e["ticker"], e.get("stock_name", "")),
+                "current_price": round(price, 2),
+                "ema_20":        round(ema_20, 2)  if ema_20  else None,
+                "ema_50":        round(ema_50, 2)  if ema_50  else None,
+                "ema_200":       round(ema_200, 2) if ema_200 else None,
+                "above_200":     above_200,
+                "dist_from_200_pct": round(dist_200, 2) if dist_200 is not None else None,
+                "bullish_stack": bullish_stack,
+                "bearish_stack": bearish_stack,
+            })
+
+        # Summary counts
+        all_data   = [e for e in result]
+        above_cnt  = sum(1 for e in all_data if e["above_200"])
+        below_cnt  = sum(1 for e in all_data if e["above_200"] is False)
+        bull_cnt   = sum(1 for e in all_data if e["bullish_stack"])
+        bear_cnt   = sum(1 for e in all_data if e["bearish_stack"])
+
+        result.sort(key=lambda x: x["dist_from_200_pct"] or 0, reverse=True)
+
+        return json.dumps({
+            "filter":        filter,
+            "count":         len(result),
+            "summary": {
+                "above_200":     above_cnt,
+                "below_200":     below_cnt,
+                "bullish_stack": bull_cnt,
+                "bearish_stack": bear_cnt,
+                "total":         len(all_data),
+            },
+            "stocks": result,
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 # ─────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS (JSON schemas for Claude)
 # ─────────────────────────────────────────────────────────────────
@@ -821,6 +1001,41 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+,
+    {
+        "name": "get_portfolio_ath",
+        "description": (
+            "Analyse portfolio all-time high (ATH), cumulative gains since Jan 2023, "
+            "drawdown from ATH, and best/worst months. Use for questions like "
+            "'when was my portfolio at its peak?', 'how far am I from ATH?', "
+            "'what was my best month?', 'what are my cumulative gains?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_technical_overview",
+        "description": (
+            "EMA position and bullish/bearish stack analysis for portfolio holdings. "
+            "Use for questions like 'how many stocks are above the 200 EMA?', "
+            "'which stocks have a bullish stack?', 'show me stocks below 200 EMA', "
+            "'what is the technical picture of my portfolio?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": "Filter to apply: 'all', 'above_200', 'below_200', 'bullish_stack', 'bearish_stack'",
+                    "enum": ["all", "above_200", "below_200", "bullish_stack", "bearish_stack"],
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -854,5 +1069,9 @@ def execute_tool(name: str, params: dict) -> str:
             start_date=params.get("start_date"),
             end_date=params.get("end_date"),
         )
+    elif name == "get_portfolio_ath":
+        return get_portfolio_ath()
+    elif name == "get_technical_overview":
+        return get_technical_overview(filter=params.get("filter", "all"))
     else:
         return json.dumps({"error": f"Unknown tool: {name}"})

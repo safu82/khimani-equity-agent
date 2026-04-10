@@ -621,11 +621,9 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
             offset += page_size
 
         for f in hist_flows:
-            amount = float(f["amount"])
-            desc   = (f.get("description") or "").lower()
-            # Withdrawl = positive stored, keep positive
-            # Deposit = negative stored, negate to positive (matches dashboard)
-            cf_values.append(amount if "withdrawl" in desc or "withdrawal" in desc else -amount)
+            # Deposits (buys) stored as negative → keep negative (money out)
+            # Withdrawals (sells) stored as positive → keep positive (money in)
+            cf_values.append(float(f["amount"]))
             cf_dates.append(date.fromisoformat(f["date"]))
 
         # Source 2: transactions table (Oct 2025 onwards)

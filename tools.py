@@ -592,7 +592,11 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
 
         for f in flows:
             cf_dates.append(date.fromisoformat(f["date"]))
-            cf_values.append(float(f["amount"]))
+            # Match dashboard sign convention:
+            # deposits stored as negative → negate to positive
+            # withdrawals stored as positive → keep positive
+            amount = float(f["amount"])
+            cf_values.append(-amount if amount < 0 else amount)
 
         # Current portfolio value as terminal positive cash flow
         holdings = sb.table("holdings") \

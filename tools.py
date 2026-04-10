@@ -542,12 +542,16 @@ def _compute_xirr(cash_flows: list, dates: list) -> float:
 
 def get_xirr(start_date: str = None, end_date: str = None) -> str:
     """
-    Compute XIRR for the Indian portfolio between two dates.
-    start_date / end_date: YYYY-MM-DD. Defaults to inception to today.
+    Compute XIRR matching the dashboard Custom Period card exactly.
+    Two data sources:
+    - cash_flows table: up to CASH_FLOWS_END_DATE (2025-10-01)
+    - transactions table: from CASH_FLOWS_END_DATE onwards
 
-    When start_date is provided, uses the closest portfolio snapshot value
-    as the opening negative cash flow so the solver always has a valid anchor.
+    start_date: YYYY-MM-DD (agent will use last snapshot of that month as opening)
+    end_date: YYYY-MM-DD (defaults to today)
     """
+    CASH_FLOWS_END_DATE = '2025-10-01'
+
     try:
         today_str = date.today().isoformat()
         end_str   = end_date or today_str
@@ -556,49 +560,85 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
         cf_values = []
 
         if start_date:
-            # Use portfolio snapshot at start_date as the opening investment
+            # Match dashboard: use last snapshot of the start month
+            start_dt   = date.fromisoformat(start_date)
+            if start_dt.month == 12:
+                month_end = date(start_dt.year + 1, 1, 1) - timedelta(days=1)
+            else:
+                month_end = date(start_dt.year, start_dt.month + 1, 1) - timedelta(days=1)
+
             snap = sb.table("portfolio_snapshots") \
                      .select("snapshot_date, total_value") \
                      .eq("portfolio", PORTFOLIO) \
-                     .lte("snapshot_date", start_date) \
+                     .lte("snapshot_date", month_end.isoformat()) \
+                     .gte("snapshot_date", start_date) \
                      .order("snapshot_date", desc=True) \
                      .limit(1) \
                      .execute().data
 
-            if snap:
-                opening_value = float(snap[0]["total_value"])
-                cf_dates.append(date.fromisoformat(start_date))
-                cf_values.append(-opening_value)
+            if not snap:
+                snap = sb.table("portfolio_snapshots") \
+                         .select("snapshot_date, total_value") \
+                         .eq("portfolio", PORTFOLIO) \
+                         .lte("snapshot_date", start_date) \
+                         .order("snapshot_date", desc=True) \
+                         .limit(1) \
+                         .execute().data
 
-            # Only cash flows AFTER start_date (opening snapshot covers before)
-            flows = sb.table("cash_flows") \
-                      .select("date, amount") \
-                      .eq("portfolio", PORTFOLIO) \
-                      .gt("date", start_date) \
-                      .lte("date", end_str) \
-                      .order("date") \
-                      .execute().data
+            if not snap:
+                return json.dumps({"error": "No snapshot found for start date"})
+
+            opening_value    = float(snap[0]["total_value"])
+            actual_start_str = snap[0]["snapshot_date"]
+            cf_dates.append(date.fromisoformat(actual_start_str))
+            cf_values.append(-opening_value)
+
         else:
-            # Inception to today — use all cash flows
-            flows = sb.table("cash_flows") \
-                      .select("date, amount") \
-                      .eq("portfolio", PORTFOLIO) \
-                      .lte("date", end_str) \
-                      .order("date") \
-                      .execute().data
+            actual_start_str = '2000-01-01'  # inception — include all
 
-        if not flows and not cf_values:
+        # Source 1: cash_flows table (up to CASH_FLOWS_END_DATE)
+        # Sign convention matching dashboard:
+        # Withdrawl (positive stored) → positive
+        # Deposit (negative stored) → negated → positive
+        # i.e. dashboard does: Withdrawl ? amount : -amount
+        hist_flows = sb.table("cash_flows") \
+                       .select("date, amount, description") \
+                       .eq("portfolio", PORTFOLIO) \
+                       .gt("date", actual_start_str) \
+                       .lte("date", min(end_str, CASH_FLOWS_END_DATE)) \
+                       .order("date") \
+                       .execute().data
+
+        for f in hist_flows:
+            amount = float(f["amount"])
+            desc   = (f.get("description") or "").lower()
+            # Withdrawl = positive stored, keep positive
+            # Deposit = negative stored, negate to positive (matches dashboard)
+            cf_values.append(amount if "withdrawl" in desc or "withdrawal" in desc else -amount)
+            cf_dates.append(date.fromisoformat(f["date"]))
+
+        # Source 2: transactions table (Oct 2025 onwards)
+        # BUY = -(qty * price), SELL = +(qty * price)
+        txn_start = max(actual_start_str, CASH_FLOWS_END_DATE)
+        txns = sb.table("transactions") \
+                 .select("date, type, quantity, price") \
+                 .eq("portfolio", PORTFOLIO) \
+                 .gte("date", txn_start) \
+                 .lte("date", end_str) \
+                 .order("date") \
+                 .execute().data
+
+        for t in txns:
+            qty   = float(t["quantity"])
+            price = float(t["price"])
+            value = qty * price
+            cf_values.append(-value if t["type"] == "BUY" else value)
+            cf_dates.append(date.fromisoformat(t["date"]))
+
+        if not cf_values:
             return json.dumps({"error": "No cash flows found for this period"})
 
-        for f in flows:
-            cf_dates.append(date.fromisoformat(f["date"]))
-            # Match dashboard sign convention:
-            # deposits stored as negative → negate to positive
-            # withdrawals stored as positive → keep positive
-            amount = float(f["amount"])
-            cf_values.append(-amount if amount < 0 else amount)
-
-        # Current portfolio value as terminal positive cash flow
+        # Terminal value: current portfolio value
         holdings = sb.table("holdings") \
                      .select("ticker, quantity, avg_cost") \
                      .eq("portfolio", PORTFOLIO) \
@@ -623,17 +663,19 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
         xirr_rate = _compute_xirr(cf_values, cf_dates)
 
         return json.dumps({
-            "xirr_pct":      round(xirr_rate * 100, 2),
-            "start_date":    cf_dates[0].isoformat(),
-            "end_date":      end_str,
-            "current_value": round(total_value, 2),
-            "num_cashflows": len(flows),
+            "xirr_pct":           round(xirr_rate * 100, 2),
+            "start_date":         cf_dates[0].isoformat(),
+            "end_date":           end_str,
+            "current_value":      round(total_value, 2),
+            "num_hist_cashflows": len(hist_flows),
+            "num_transactions":   len(txns),
         })
 
     except ValueError as e:
         return json.dumps({"error": f"XIRR computation failed: {str(e)}"})
     except Exception as e:
         return json.dumps({"error": str(e)})
+
 
 
 # ─────────────────────────────────────────────────────────────────

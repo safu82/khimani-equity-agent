@@ -601,13 +601,24 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
         # Withdrawl (positive stored) → positive
         # Deposit (negative stored) → negated → positive
         # i.e. dashboard does: Withdrawl ? amount : -amount
-        hist_flows = sb.table("cash_flows") \
-                       .select("date, amount, description") \
-                       .eq("portfolio", PORTFOLIO) \
-                       .gt("date", actual_start_str) \
-                       .lte("date", min(end_str, CASH_FLOWS_END_DATE)) \
-                       .order("date") \
-                       .execute().data
+        # Paginate cash_flows — can exceed 1000 rows for long periods
+        hist_flows = []
+        page_size  = 1000
+        offset     = 0
+        end_cf     = min(end_str, CASH_FLOWS_END_DATE)
+        while True:
+            batch = sb.table("cash_flows") \
+                      .select("date, amount, description") \
+                      .eq("portfolio", PORTFOLIO) \
+                      .gt("date", actual_start_str) \
+                      .lte("date", end_cf) \
+                      .order("date") \
+                      .range(offset, offset + page_size - 1) \
+                      .execute().data
+            hist_flows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
 
         for f in hist_flows:
             amount = float(f["amount"])

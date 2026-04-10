@@ -489,41 +489,53 @@ def get_transactions(
 # ─────────────────────────────────────────────────────────────────
 # TOOL 8: get_xirr
 # ─────────────────────────────────────────────────────────────────
-def _xirr_npv(rate: float, cash_flows: list, days: list) -> float:
-    """Net present value for a given rate."""
-    return sum(cf / (1 + rate) ** (d / 365.0) for cf, d in zip(cash_flows, days))
-
-
-def _xirr_npv_derivative(rate: float, cash_flows: list, days: list) -> float:
-    """Derivative of NPV with respect to rate."""
-    return sum(
-        -cf * (d / 365.0) / (1 + rate) ** (d / 365.0 + 1)
-        for cf, d in zip(cash_flows, days)
-    )
-
-
 def _compute_xirr(cash_flows: list, dates: list) -> float:
     """
-    Newton-Raphson XIRR solver.
-    cash_flows: list of floats (negative = money out, positive = money in)
-    dates: list of date objects
+    Newton-Raphson XIRR solver matching the dashboard Custom Period card.
+    Uses 365.25 day year, 1000 iterations, step capping and rate clamping.
+    cash_flows: negative = money out, positive = money in
     Returns annualised rate as a decimal (e.g. 0.15 for 15%).
     """
-    t0    = dates[0]
-    days  = [(d - t0).days for d in dates]
-    guesses = [0.1, 0.0, -0.1, 0.5, -0.5]
+    t0             = dates[0]
+    days           = [(d - t0).days for d in dates]
+    max_iterations = 1000
+    tolerance      = 1e-6
+    max_change     = 0.5
+    guesses        = [0.1, 0.0, -0.1, 0.5, -0.5]
 
-    for guess in guesses:
-        rate = guess
-        for _ in range(100):
-            npv  = _xirr_npv(rate, cash_flows, days)
-            deri = _xirr_npv_derivative(rate, cash_flows, days)
-            if abs(deri) < 1e-12:
-                break
-            new_rate = rate - npv / deri
-            if abs(new_rate - rate) < 1e-7:
-                return new_rate
-            rate = new_rate
+    for initial_guess in guesses:
+        guess = initial_guess
+        npv   = 0.0
+        for _ in range(max_iterations):
+            npv  = 0.0
+            dnpv = 0.0
+            for cf, d in zip(cash_flows, days):
+                year_frac = d / 365.25
+                factor    = (1 + guess) ** year_frac
+                npv  += cf / factor
+                dnpv += -year_frac * cf / factor / (1 + guess)
+
+            if abs(npv) < tolerance:
+                return guess
+
+            if abs(dnpv) < 1e-10:
+                guess = guess * 0.5
+                continue
+
+            new_guess = guess - npv / dnpv
+
+            if abs(new_guess - guess) > max_change:
+                new_guess = guess + (max_change if new_guess > guess else -max_change)
+
+            guess = new_guess
+
+            if guess < -0.99:
+                guess = -0.5
+            if guess > 10:
+                guess = 1.0
+
+        if abs(npv) < 0.01:
+            return guess
 
     raise ValueError("XIRR did not converge")
 
@@ -531,34 +543,56 @@ def _compute_xirr(cash_flows: list, dates: list) -> float:
 def get_xirr(start_date: str = None, end_date: str = None) -> str:
     """
     Compute XIRR for the Indian portfolio between two dates.
-    start_date / end_date: 'YYYY-MM-DD'. Defaults to inception → today.
+    start_date / end_date: YYYY-MM-DD. Defaults to inception to today.
+
+    When start_date is provided, uses the closest portfolio snapshot value
+    as the opening negative cash flow so the solver always has a valid anchor.
     """
     try:
         today_str = date.today().isoformat()
         end_str   = end_date or today_str
 
-        # Fetch cash flows
-        query = sb.table("cash_flows") \
-                  .select("date, amount") \
-                  .eq("portfolio", PORTFOLIO) \
-                  .order("date")
-
-        if start_date:
-            query = query.gte("date", start_date)
-        if end_date:
-            query = query.lte("date", end_date)
-
-        flows = query.execute().data
-
-        if not flows:
-            return json.dumps({"error": "No cash flows found for this period"})
-
-        # Build cash flow list: investments are negative (money out)
         cf_dates  = []
         cf_values = []
+
+        if start_date:
+            # Use portfolio snapshot at start_date as the opening investment
+            snap = sb.table("portfolio_snapshots") \
+                     .select("snapshot_date, total_value") \
+                     .eq("portfolio", PORTFOLIO) \
+                     .lte("snapshot_date", start_date) \
+                     .order("snapshot_date", desc=True) \
+                     .limit(1) \
+                     .execute().data
+
+            if snap:
+                opening_value = float(snap[0]["total_value"])
+                cf_dates.append(date.fromisoformat(start_date))
+                cf_values.append(-opening_value)
+
+            # Only cash flows AFTER start_date (opening snapshot covers before)
+            flows = sb.table("cash_flows") \
+                      .select("date, amount") \
+                      .eq("portfolio", PORTFOLIO) \
+                      .gt("date", start_date) \
+                      .lte("date", end_str) \
+                      .order("date") \
+                      .execute().data
+        else:
+            # Inception to today — use all cash flows
+            flows = sb.table("cash_flows") \
+                      .select("date, amount") \
+                      .eq("portfolio", PORTFOLIO) \
+                      .lte("date", end_str) \
+                      .order("date") \
+                      .execute().data
+
+        if not flows and not cf_values:
+            return json.dumps({"error": "No cash flows found for this period"})
+
         for f in flows:
             cf_dates.append(date.fromisoformat(f["date"]))
-            cf_values.append(float(f["amount"]))  # should already be negative for investments
+            cf_values.append(float(f["amount"]))
 
         # Current portfolio value as terminal positive cash flow
         holdings = sb.table("holdings") \
@@ -579,7 +613,6 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
             for h in holdings
         )
 
-        # Add terminal value
         cf_dates.append(date.fromisoformat(end_str))
         cf_values.append(total_value)
 

@@ -693,45 +693,54 @@ def get_xirr(start_date: str = None, end_date: str = None) -> str:
 # ─────────────────────────────────────────────────────────────────
 def get_portfolio_ath() -> str:
     """
-    Compute cumulative profit gains (not portfolio value) from Jan 2023.
-    Monthly gain = endValue - startValue + withdrawals - deposits
-    ATH = peak cumulative gain, not peak portfolio value.
-    Uses SQL aggregation for cash_flows to handle 20,000+ rows efficiently.
+    Compute cumulative portfolio gains matching dashboard Analytics tab exactly.
+    Formula per month:
+      monthGain = monthEndValue + withdrawals + soldValue - deposits - purchasedValue - prevMonthEnd
+    Where:
+      - withdrawals/deposits come from cash_flows (both as absolute values)
+      - soldValue/purchasedValue come from transactions table (Oct 2025+)
+    ATH = peak of running cumulative gain total.
     """
+    CASH_FLOWS_END_DATE = '2025-10-01'
+
     try:
-        # 1. Get all monthly snapshots from Jan 2023
+        # 1. All snapshots from Dec 2022 (dashboard starts Dec 2022)
         snapshots = sb.table("portfolio_snapshots") \
                       .select("snapshot_date, total_value") \
                       .eq("portfolio", PORTFOLIO) \
-                      .gte("snapshot_date", "2023-01-01") \
+                      .gte("snapshot_date", "2022-12-01") \
                       .order("snapshot_date") \
                       .execute().data
 
         if len(snapshots) < 2:
             return json.dumps({"error": "Not enough snapshots found"})
 
-        # 2. Aggregate cash_flows by month (server-side — handles 20k+ rows)
-        # withdrawals = positive amounts (sells), deposits = negative amounts (buys)
+        snap_by_date = {s["snapshot_date"]: float(s["total_value"]) for s in snapshots}
+
+        def get_closest_snapshot(target_date_str):
+            """Find closest snapshot on or before target date."""
+            candidates = [d for d in snap_by_date if d <= target_date_str]
+            if not candidates:
+                return None
+            return snap_by_date[max(candidates)]
+
+        # 2. Aggregate cash_flows by month using RPC
         cf_agg_raw = sb.rpc("get_monthly_cashflows", {
             "p_portfolio": PORTFOLIO,
-            "p_from_date": "2023-01-01",
-        }).execute().data
+            "p_from_date": "2022-12-01",
+        }).execute().data or []
 
-        # Fall back to manual aggregation if RPC not available
-        if cf_agg_raw is None:
-            cf_agg_raw = []
-
-        # Build month → {withdrawals, deposits} lookup
+        # cf_by_month: {YYYY-MM: {withdrawals: x, deposits: x}}
+        # RPC returns withdrawals (positive stored) and deposits (abs of negative stored)
         cf_by_month: dict = {}
         for row in cf_agg_raw:
-            month_key = str(row["month"])[:7]  # YYYY-MM
+            month_key = str(row["month"])[:7]
             cf_by_month[month_key] = {
                 "withdrawals": float(row.get("withdrawals") or 0),
                 "deposits":    float(row.get("deposits") or 0),
             }
 
-        # 3. Get Oct 2025+ transactions (BUY=deposit, SELL=withdrawal)
-        CASH_FLOWS_END_DATE = "2025-10-01"
+        # 3. Oct 2025+ transactions aggregated by month
         txns = sb.table("transactions") \
                  .select("date, type, quantity, price") \
                  .eq("portfolio", PORTFOLIO) \
@@ -739,49 +748,18 @@ def get_portfolio_ath() -> str:
                  .order("date") \
                  .execute().data
 
-        # Aggregate transactions by month
+        txn_by_month: dict = {}
         for t in txns:
             month_key = t["date"][:7]
             value     = float(t["quantity"]) * float(t["price"])
-            if month_key not in cf_by_month:
-                cf_by_month[month_key] = {"withdrawals": 0, "deposits": 0}
+            if month_key not in txn_by_month:
+                txn_by_month[month_key] = {"sold": 0, "purchased": 0}
             if t["type"] == "SELL":
-                cf_by_month[month_key]["withdrawals"] += value
+                txn_by_month[month_key]["sold"]      += value
             else:
-                cf_by_month[month_key]["deposits"] += value
+                txn_by_month[month_key]["purchased"] += value
 
-        # 4. Compute monthly gains and cumulative gains
-        # gain = endValue - startValue + withdrawals - deposits
-        monthly_gains  = []
-        cumulative     = 0.0
-        ath_cumulative = 0.0
-        ath_date       = snapshots[0]["snapshot_date"]
-
-        snap_by_date = {s["snapshot_date"]: float(s["total_value"]) for s in snapshots}
-        snap_dates   = sorted(snap_by_date.keys())
-
-        for i in range(1, len(snap_dates)):
-            prev_date = snap_dates[i - 1]
-            curr_date = snap_dates[i]
-            prev_val  = snap_by_date[prev_date]
-            curr_val  = snap_by_date[curr_date]
-            month_key = curr_date[:7]
-
-            cf        = cf_by_month.get(month_key, {"withdrawals": 0, "deposits": 0})
-            gain      = curr_val - prev_val + cf["withdrawals"] - cf["deposits"]
-            cumulative += gain
-
-            if cumulative > ath_cumulative:
-                ath_cumulative = cumulative
-                ath_date       = curr_date
-
-            monthly_gains.append({
-                "date":        curr_date,
-                "gain":        round(gain, 2),
-                "cumulative":  round(cumulative, 2),
-            })
-
-        # 5. Add current month (live value vs last snapshot)
+        # 4. Current live portfolio value
         holdings = sb.table("holdings") \
                      .select("ticker, quantity, avg_cost") \
                      .eq("portfolio", PORTFOLIO) \
@@ -794,33 +772,88 @@ def get_portfolio_ath() -> str:
                        .execute().data
 
         prices = {p["ticker"]: float(p.get("price") or 0) for p in prices_raw}
-
-        current_value  = sum(
+        current_value = sum(
             float(h["quantity"]) * prices.get(h["ticker"], float(h["avg_cost"]))
             for h in holdings
         )
-        last_snap_val  = snap_by_date[snap_dates[-1]]
-        today_str      = date.today().isoformat()
-        today_month    = today_str[:7]
-        cf_today       = cf_by_month.get(today_month, {"withdrawals": 0, "deposits": 0})
-        current_gain   = current_value - last_snap_val + cf_today["withdrawals"] - cf_today["deposits"]
-        cumulative_now = cumulative + current_gain
 
-        if cumulative_now > ath_cumulative:
-            ath_cumulative = cumulative_now
-            ath_date       = today_str
+        # 5. Iterate month by month from Dec 2022 to today
+        from datetime import date as date_cls
+        import calendar
 
-        drawdown_from_ath = cumulative_now - ath_cumulative
-        drawdown_pct      = (drawdown_from_ath / ath_cumulative * 100) if ath_cumulative else 0
+        running_total      = 0.0
+        ath_value          = float("-inf")
+        ath_month_str      = ""
+        current_cumulative = 0.0
+        monthly_gains      = []
+
+        today      = date_cls.today()
+        cur        = date_cls(2022, 12, 1)
+
+        while cur <= today:
+            year     = cur.year
+            month    = cur.month
+            month_key = f"{year}-{month:02d}"
+            last_day  = calendar.monthrange(year, month)[1]
+            month_end_str = f"{year}-{month:02d}-{last_day:02d}"
+
+            # Previous month end
+            if month == 1:
+                prev_last = calendar.monthrange(year - 1, 12)[1]
+                prev_end_str = f"{year-1}-12-{prev_last:02d}"
+            else:
+                prev_last    = calendar.monthrange(year, month - 1)[1]
+                prev_end_str = f"{year}-{month-1:02d}-{prev_last:02d}"
+
+            prev_val = get_closest_snapshot(prev_end_str)
+            is_current_month = (year == today.year and month == today.month)
+
+            if is_current_month:
+                month_end_val = current_value
+            else:
+                month_end_val = get_closest_snapshot(month_end_str)
+
+            if prev_val is not None and month_end_val is not None:
+                cf      = cf_by_month.get(month_key, {"withdrawals": 0, "deposits": 0})
+                tx      = txn_by_month.get(month_key, {"sold": 0, "purchased": 0})
+                # Match dashboard formula exactly:
+                # monthGain = monthEndValue + withdrawals + soldValue - deposits - purchasedValue - prevMonthEnd
+                month_gain = (
+                    month_end_val
+                    + cf["withdrawals"] + tx["sold"]
+                    - cf["deposits"]   - tx["purchased"]
+                    - prev_val
+                )
+                running_total += month_gain
+
+                if running_total > ath_value:
+                    ath_value     = running_total
+                    ath_month_str = cur.strftime("%b %Y")
+
+                if is_current_month:
+                    current_cumulative = running_total
+
+                monthly_gains.append({
+                    "month": month_key,
+                    "gain":  round(month_gain, 2),
+                    "cumulative": round(running_total, 2),
+                })
+
+            # Next month
+            if month == 12:
+                cur = date_cls(year + 1, 1, 1)
+            else:
+                cur = date_cls(year, month + 1, 1)
+
+        ath_diff_pct = ((current_cumulative - ath_value) / ath_value * 100) if ath_value > 0 else 0
 
         gains_sorted = sorted(monthly_gains, key=lambda x: x["gain"], reverse=True)
 
         return json.dumps({
-            "ath_cumulative_gain": round(ath_cumulative, 2),
-            "ath_date":            ath_date,
-            "current_cumulative":  round(cumulative_now, 2),
-            "drawdown_from_ath":   round(drawdown_from_ath, 2),
-            "drawdown_pct":        round(drawdown_pct, 2),
+            "ath_cumulative_gain": round(ath_value, 2),
+            "ath_month":           ath_month_str,
+            "current_cumulative":  round(current_cumulative, 2),
+            "ath_diff_pct":        round(ath_diff_pct, 2),
             "best_month":          gains_sorted[0]  if gains_sorted else None,
             "worst_month":         gains_sorted[-1] if gains_sorted else None,
             "total_months":        len(monthly_gains),
@@ -849,60 +882,87 @@ def get_technical_overview(filter: str = "all") -> str:
         tickers    = [h["ticker"] for h in holdings]
         ticker_map = {h["ticker"]: h["name"] for h in holdings}
 
-        # stock_ema_values uses tickers without .NS suffix — strip it
-        stripped_tickers = [t.replace(".NS", "").replace(".BO", "") for t in tickers]
+        # Get live prices for holdings
+        prices_raw = sb.table("live_prices") \
+                       .select("ticker, price") \
+                       .in_("ticker", tickers) \
+                       .execute().data
+        live_price_map = {p["ticker"]: float(p.get("price") or 0) for p in prices_raw}
 
-        # Get EMA data for holdings
-        ema_raw = sb.table("stock_ema_values") \
-                    .select("ticker, stock_name, current_price, ema_20, ema_50, ema_200, is_stacked, is_bearish_stacked") \
-                    .in_("ticker", stripped_tickers) \
+        # Get latest EMA values from daily_stock_snapshots (uses .NS format, updated daily)
+        # Fetch most recent snapshot per ticker using a subquery via RPC not available,
+        # so fetch last 2 days and pick the latest per ticker
+        today_str     = date.today().isoformat()
+        two_days_ago  = (date.today() - timedelta(days=5)).isoformat()
+
+        ema_raw = sb.table("daily_stock_snapshots") \
+                    .select("ticker, snapshot_date, ema_20, ema_50, ema_200") \
+                    .in_("ticker", tickers) \
+                    .gte("snapshot_date", two_days_ago) \
+                    .order("snapshot_date", desc=True) \
                     .execute().data
 
-        # Build reverse map: stripped ticker → original ticker
-        strip_map = {t.replace(".NS", "").replace(".BO", ""): t for t in tickers}
+        # Keep only latest snapshot per ticker
+        latest_ema: dict = {}
+        for row in ema_raw:
+            t = row["ticker"]
+            if t not in latest_ema:
+                latest_ema[t] = row
 
-        if not ema_raw:
-            return json.dumps({"error": "No EMA data found for holdings"})
+        if not latest_ema:
+            return json.dumps({"error": "No EMA data found in daily_stock_snapshots for holdings"})
 
         # Enrich and filter
         result = []
-        for e in ema_raw:
-            price   = float(e.get("current_price") or 0)
+        for t in tickers:
+            e       = latest_ema.get(t)
+            if not e:
+                continue
+
+            price   = live_price_map.get(t, 0)
             ema_200 = float(e.get("ema_200") or 0)
             ema_50  = float(e.get("ema_50") or 0)
             ema_20  = float(e.get("ema_20") or 0)
 
-            above_200     = price > ema_200 if ema_200 else None
-            bullish_stack = e.get("is_stacked") or False
-            bearish_stack = e.get("is_bearish_stacked") or False
+            above_200     = price > ema_200 if ema_200 and price else None
+            # Bullish stack: price > ema_20 > ema_50 > ema_200
+            bullish_stack = bool(
+                price and ema_20 and ema_50 and ema_200
+                and price > ema_20 > ema_50 > ema_200
+            )
+            # Bearish stack: price < ema_20 < ema_50 < ema_200
+            bearish_stack = bool(
+                price and ema_20 and ema_50 and ema_200
+                and price < ema_20 < ema_50 < ema_200
+            )
 
             # Apply filter
-            if filter == "above_200"    and not above_200:      continue
-            if filter == "below_200"    and above_200 is not False: continue
-            if filter == "bullish_stack" and not bullish_stack: continue
-            if filter == "bearish_stack" and not bearish_stack: continue
+            if filter == "above_200"     and not above_200:                 continue
+            if filter == "below_200"     and above_200 is not False:        continue
+            if filter == "bullish_stack" and not bullish_stack:             continue
+            if filter == "bearish_stack" and not bearish_stack:             continue
 
-            dist_200 = ((price - ema_200) / ema_200 * 100) if ema_200 else None
+            dist_200 = ((price - ema_200) / ema_200 * 100) if ema_200 and price else None
 
             result.append({
-                "ticker":        e["ticker"],
-                "name":          ticker_map.get(strip_map.get(e["ticker"], e["ticker"]), e.get("stock_name", "")),
-                "current_price": round(price, 2),
-                "ema_20":        round(ema_20, 2)  if ema_20  else None,
-                "ema_50":        round(ema_50, 2)  if ema_50  else None,
-                "ema_200":       round(ema_200, 2) if ema_200 else None,
-                "above_200":     above_200,
+                "ticker":            t,
+                "name":              ticker_map.get(t, ""),
+                "current_price":     round(price, 2),
+                "ema_20":            round(ema_20, 2)  if ema_20  else None,
+                "ema_50":            round(ema_50, 2)  if ema_50  else None,
+                "ema_200":           round(ema_200, 2) if ema_200 else None,
+                "above_200":         above_200,
                 "dist_from_200_pct": round(dist_200, 2) if dist_200 is not None else None,
-                "bullish_stack": bullish_stack,
-                "bearish_stack": bearish_stack,
+                "bullish_stack":     bullish_stack,
+                "bearish_stack":     bearish_stack,
+                "ema_date":          e.get("snapshot_date"),
             })
 
-        # Summary counts
-        all_data   = [e for e in result]
-        above_cnt  = sum(1 for e in all_data if e["above_200"])
-        below_cnt  = sum(1 for e in all_data if e["above_200"] is False)
-        bull_cnt   = sum(1 for e in all_data if e["bullish_stack"])
-        bear_cnt   = sum(1 for e in all_data if e["bearish_stack"])
+        all_data  = result
+        above_cnt = sum(1 for e in all_data if e["above_200"])
+        below_cnt = sum(1 for e in all_data if e["above_200"] is False)
+        bull_cnt  = sum(1 for e in all_data if e["bullish_stack"])
+        bear_cnt  = sum(1 for e in all_data if e["bearish_stack"])
 
         result.sort(key=lambda x: x["dist_from_200_pct"] or 0, reverse=True)
 

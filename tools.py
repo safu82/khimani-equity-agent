@@ -982,6 +982,335 @@ def get_technical_overview(filter: str = "all") -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+
+# ─────────────────────────────────────────────────────────────────
+# TOOL 11: get_stock_news
+# ─────────────────────────────────────────────────────────────────
+def get_stock_news(ticker: str = None, days: int = 7) -> str:
+    """
+    Fetch recent news for a specific stock or all holdings.
+    Sources: Yahoo Finance news + NSE corporate announcements.
+    ticker: Yahoo Finance ticker e.g. 'INFY.NS', or partial name.
+            If None, fetches news for all holdings.
+    days: lookback window in days (default 7).
+    """
+    import yfinance as yf
+    import requests as req
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # Resolve tickers to fetch news for
+        if ticker:
+            # Try exact match first, then name match
+            holding = sb.table("holdings")                         .select("ticker, name")                         .eq("portfolio", PORTFOLIO)                         .ilike("ticker", f"%{ticker.replace('.NS','').replace('.BO','')}%")                         .limit(1)                         .execute().data
+
+            if not holding:
+                holding = sb.table("holdings")                             .select("ticker, name")                             .eq("portfolio", PORTFOLIO)                             .ilike("name", f"%{ticker}%")                             .limit(1)                             .execute().data
+
+            if not holding:
+                return json.dumps({"error": f"No holding found matching '{ticker}'"})
+
+            tickers_to_fetch = [(holding[0]["ticker"], holding[0]["name"])]
+        else:
+            holdings = sb.table("holdings")                          .select("ticker, name")                          .eq("portfolio", PORTFOLIO)                          .execute().data
+            tickers_to_fetch = [(h["ticker"], h["name"]) for h in holdings]
+
+        all_news = []
+
+        for t, name in tickers_to_fetch:
+            stock_news = []
+
+            # ── Yahoo Finance news ──────────────────────────────
+            try:
+                yf_ticker = yf.Ticker(t)
+                yf_news   = yf_ticker.news or []
+
+                for item in yf_news:
+                    # yfinance returns providerPublishTime as unix timestamp
+                    pub_ts = item.get("providerPublishTime") or item.get("published", 0)
+                    if isinstance(pub_ts, (int, float)):
+                        pub_dt = datetime.fromtimestamp(pub_ts, tz=timezone.utc)
+                    else:
+                        continue
+
+                    if pub_dt < cutoff:
+                        continue
+
+                    content_info = item.get("content", {})
+                    title = (
+                        content_info.get("title")
+                        or item.get("title")
+                        or ""
+                    )
+                    link = (
+                        content_info.get("canonicalUrl", {}).get("url")
+                        or item.get("link")
+                        or ""
+                    )
+                    publisher = (
+                        content_info.get("provider", {}).get("displayName")
+                        or item.get("publisher")
+                        or ""
+                    )
+
+                    if title:
+                        stock_news.append({
+                            "source":    "yahoo",
+                            "title":     title,
+                            "publisher": publisher,
+                            "published": pub_dt.strftime("%Y-%m-%d %H:%M"),
+                            "url":       link,
+                        })
+            except Exception as e:
+                pass  # Yahoo news fetch failure is non-fatal
+
+            # ── NSE corporate announcements ─────────────────────
+            try:
+                nse_symbol = t.replace(".NS", "").replace(".BO", "")
+                nse_url    = (
+                    f"https://www.nseindia.com/api/corp-info"
+                    f"?symbol={nse_symbol}&corpType=announcements&market=equities"
+                )
+                headers = {
+                    "User-Agent":      "Mozilla/5.0",
+                    "Accept":          "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer":         "https://www.nseindia.com/",
+                }
+                # NSE requires a session cookie — use a quick pre-request
+                session = req.Session()
+                session.get("https://www.nseindia.com", headers=headers, timeout=5)
+                resp    = session.get(nse_url, headers=headers, timeout=5)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    annts = data.get("data", []) if isinstance(data, dict) else []
+
+                    for ann in annts[:10]:  # latest 10
+                        ann_date_str = ann.get("date") or ann.get("brdDate") or ""
+                        try:
+                            ann_dt = datetime.strptime(ann_date_str[:10], "%d-%b-%Y").replace(tzinfo=timezone.utc)
+                        except Exception:
+                            continue
+
+                        if ann_dt < cutoff:
+                            continue
+
+                        desc = ann.get("desc") or ann.get("subject") or ""
+                        if desc:
+                            stock_news.append({
+                                "source":    "nse",
+                                "title":     desc,
+                                "publisher": "NSE",
+                                "published": ann_dt.strftime("%Y-%m-%d"),
+                                "url":       f"https://www.nseindia.com/get-quotes/equity?symbol={nse_symbol}",
+                            })
+            except Exception:
+                pass  # NSE fetch failure is non-fatal
+
+            if stock_news:
+                # Sort by published date descending
+                stock_news.sort(key=lambda x: x["published"], reverse=True)
+                all_news.append({
+                    "ticker":      t,
+                    "name":        name,
+                    "news_count":  len(stock_news),
+                    "news":        stock_news[:10],  # cap at 10 per stock
+                })
+
+        return json.dumps({
+            "days":        days,
+            "stocks_with_news": len(all_news),
+            "results":     all_news,
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────
+# TOOL 12: analyze_decision
+# ─────────────────────────────────────────────────────────────────
+def analyze_decision(question: str) -> str:
+    """
+    Free-form portfolio reasoning tool.
+    Pulls a broad data bundle (holdings, trades, signals, news,
+    XIRR, ATH) and makes a second Claude API call to reason
+    across all of it in response to the user's question.
+    Returns narrative insight, not structured data.
+    """
+    import anthropic as anthropic_sdk
+    import os
+
+    try:
+        # ── 1. Pull data bundle ─────────────────────────────────
+
+        # Holdings + live prices + EMA
+        holdings_raw = sb.table("holdings")                          .select("ticker, name, quantity, avg_cost, sector")                          .eq("portfolio", PORTFOLIO)                          .execute().data
+
+        tickers    = [h["ticker"] for h in holdings_raw]
+        prices_raw = sb.table("live_prices")                        .select("ticker, price, day_change_pct")                        .in_("ticker", tickers)                        .execute().data
+        prices = {p["ticker"]: p for p in prices_raw}
+
+        # EMA from daily_stock_snapshots (last 5 days)
+        five_days_ago = (date.today() - timedelta(days=5)).isoformat()
+        ema_raw = sb.table("daily_stock_snapshots")                     .select("ticker, snapshot_date, ema_20, ema_50, ema_200")                     .in_("ticker", tickers)                     .gte("snapshot_date", five_days_ago)                     .order("snapshot_date", desc=True)                     .execute().data
+        latest_ema = {}
+        for row in ema_raw:
+            if row["ticker"] not in latest_ema:
+                latest_ema[row["ticker"]] = row
+
+        # Build enriched holdings list
+        holdings_enriched = []
+        total_value    = 0.0
+        total_invested = 0.0
+        for h in holdings_raw:
+            t     = h["ticker"]
+            qty   = float(h["quantity"])
+            avg   = float(h["avg_cost"])
+            p     = prices.get(t, {})
+            ltp   = float(p.get("price") or avg)
+            ema   = latest_ema.get(t, {})
+            curr  = qty * ltp
+            inv   = qty * avg
+            pnl   = curr - inv
+            pnl_p = (pnl / inv * 100) if inv else 0
+
+            ema_200 = float(ema.get("ema_200") or 0)
+            ema_50  = float(ema.get("ema_50") or 0)
+            ema_20  = float(ema.get("ema_20") or 0)
+
+            stack = "bullish" if (ltp > ema_20 > ema_50 > ema_200 and ema_200 > 0)                     else "bearish" if (ema_200 > ema_50 > ema_20 > ltp and ema_200 > 0)                     else "above_200" if (ltp > ema_200 > 0)                     else "below_200" if (ema_200 > 0 and ltp < ema_200)                     else "unknown"
+
+            total_value    += curr
+            total_invested += inv
+            holdings_enriched.append({
+                "ticker":   t,
+                "name":     h["name"],
+                "sector":   h["sector"],
+                "qty":      qty,
+                "avg_cost": round(avg, 2),
+                "ltp":      round(ltp, 2),
+                "pnl_pct":  round(pnl_p, 2),
+                "pnl":      round(pnl, 2),
+                "weight":   0,  # filled below
+                "ema_stack": stack,
+                "day_chg_pct": float(p.get("day_change_pct") or 0),
+            })
+
+        for h in holdings_enriched:
+            h["weight"] = round(h["qty"] * h["ltp"] / total_value * 100, 2) if total_value else 0
+
+        # Last 90 days of transactions
+        since_90 = (date.today() - timedelta(days=90)).isoformat()
+        txns = sb.table("transactions")                  .select("date, type, stock, ticker, quantity, price, sector")                  .eq("portfolio", PORTFOLIO)                  .gte("date", since_90)                  .order("date", desc=True)                  .limit(100)                  .execute().data
+
+        for t in txns:
+            t["value"] = round(float(t["quantity"]) * float(t["price"]), 2)
+
+        # Last 30 days of signals on holdings
+        since_30 = (date.today() - timedelta(days=30)).isoformat()
+        signals = sb.table("alerts")                     .select("ticker, stock_name, alert_type, alert_title, alert_date, price")                     .in_("ticker", tickers)                     .gte("alert_date", since_30)                     .order("alert_date", desc=True)                     .limit(50)                     .execute().data
+
+        # ATH summary
+        ath_raw = json.loads(get_portfolio_ath())
+
+        # News for stocks mentioned in the question (best effort)
+        news_data = []
+        try:
+            # Try to identify tickers mentioned in question
+            question_upper = question.upper()
+            mentioned = [h for h in holdings_raw
+                        if h["name"].split()[0].upper() in question_upper
+                        or h["ticker"].replace(".NS","") in question_upper]
+            if mentioned:
+                for h in mentioned[:3]:
+                    news_raw = json.loads(get_stock_news(ticker=h["ticker"], days=14))
+                    if "results" in news_raw:
+                        news_data.extend(news_raw["results"])
+        except Exception:
+            pass
+
+        # ── 2. Build context for reasoning ─────────────────────
+        total_pnl     = total_value - total_invested
+        total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0
+
+        context = f"""PORTFOLIO SNAPSHOT — {date.today().isoformat()}
+
+SUMMARY:
+- Total Value: ₹{total_value:,.0f}
+- Total Invested: ₹{total_invested:,.0f}
+- Unrealized P&L: ₹{total_pnl:,.0f} ({total_pnl_pct:.1f}%)
+- ATH Cumulative Gain: ₹{ath_raw.get('ath_cumulative_gain', 0):,.0f} in {ath_raw.get('ath_month', 'N/A')}
+- Current vs ATH: {ath_raw.get('ath_diff_pct', 0):.1f}%
+
+HOLDINGS ({len(holdings_enriched)} stocks):
+{json.dumps(sorted(holdings_enriched, key=lambda x: x['weight'], reverse=True), indent=2)}
+
+RECENT TRANSACTIONS (last 90 days, {len(txns)} trades):
+{json.dumps(txns, indent=2)}
+
+RECENT SIGNALS ON HOLDINGS (last 30 days):
+{json.dumps(signals, indent=2)}
+
+RECENT NEWS:
+{json.dumps(news_data, indent=2) if news_data else 'No news fetched for this query.'}
+"""
+
+        # ── 3. Second Claude call — free reasoning ──────────────
+        analyst_client = anthropic_sdk.Anthropic(
+            api_key=os.getenv("ANTHROPIC_API_KEY")
+        )
+
+        analyst_prompt = f"""You are a sharp, experienced proprietary equity trader analyzing Sarfaraz Khimani's Indian portfolio.
+
+You have been given:
+- Full portfolio holdings with P&L, weights, and EMA stack status
+- Last 90 days of buy/sell transactions
+- Recent technical signals
+- Recent news (if relevant)
+- ATH cumulative profit context
+
+USER QUESTION:
+{question}
+
+PORTFOLIO DATA:
+{context}
+
+Your job:
+- Reason freely across ALL the data provided
+- Identify non-obvious patterns, correlations, or risks
+- Be direct and specific — name stocks, sectors, dates
+- Lead with the most important insight
+- Use Indian number formatting (₹ with L for lakhs, Cr for crores)
+- Keep response under 400 words unless deep analysis is needed
+- Do NOT just describe the data — synthesize and interpret it
+- Think like a trader, not a data reporter"""
+
+        response = analyst_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": analyst_prompt}],
+        )
+
+        insight = response.content[0].text if response.content else "Analysis failed."
+
+        return json.dumps({
+            "question": question,
+            "insight":  insight,
+            "data_used": {
+                "holdings":     len(holdings_enriched),
+                "transactions": len(txns),
+                "signals":      len(signals),
+                "news_stocks":  len(news_data),
+            }
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 # ─────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS (JSON schemas for Claude)
 # ─────────────────────────────────────────────────────────────────
@@ -1150,6 +1479,49 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    {
+        "name": "get_stock_news",
+        "description": (
+            "Fetch recent news and NSE corporate announcements for a specific stock "
+            "or all holdings. Use for questions like 'any news on Infosys?', "
+            "'what announcements has KPEL made?', 'any recent results dates?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker symbol or partial company name. If omitted, fetches news for all holdings.",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window in days (default 7, max 30)",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "analyze_decision",
+        "description": (
+            "Deep portfolio reasoning tool. Pulls holdings, recent trades, signals, "
+            "and news, then reasons freely across all of it to answer complex questions. "
+            "Use for questions like: 'what patterns exist in my losing trades?', "
+            "'is my portfolio riskier than usual?', 'which stock resembles my past winners?', "
+            "'what should I change in my strategy?', 'why am I underperforming?'. "
+            "Note: takes 15-30 seconds to respond."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The analytical question to reason about",
+                },
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
 
@@ -1187,5 +1559,12 @@ def execute_tool(name: str, params: dict) -> str:
         return get_portfolio_ath()
     elif name == "get_technical_overview":
         return get_technical_overview(filter=params.get("filter", "all"))
+    elif name == "get_stock_news":
+        return get_stock_news(
+            ticker=params.get("ticker"),
+            days=params.get("days", 7),
+        )
+    elif name == "analyze_decision":
+        return analyze_decision(question=params.get("question", ""))
     else:
         return json.dumps({"error": f"Unknown tool: {name}"})

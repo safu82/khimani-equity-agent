@@ -1316,88 +1316,111 @@ Your job:
 # TOOL 13: get_market_signals
 # ─────────────────────────────────────────────────────────────────
 def get_market_signals(
-    sector:      str = None,
     signal_type: str = None,
-    days:        int = 7,
-    limit:       int = 20,
+    strength:    str = None,
+    sector:      str = None,
+    limit:       int = 30,
 ) -> str:
     """
-    Query market-wide technical signals from entry_signals and market_alerts.
-    Covers stocks outside the portfolio too.
-    Optionally filter by sector (joins indian_stock_sectors) or signal type.
+    Query the Technical Alerts tab — mirrors the dashboard exactly.
+    Fetches signals from the latest available date only (same as dashboard).
+    
+    signal_type options:
+      'macd'         → macd_buy + macd_strong
+      'blue_zone'    → blue_zone_buy + blue_zone_strong
+      'golden_cross' → golden_cross_buy + golden_cross_strong
+      'narrow_cpr'   → narrow_cpr_breakaway
+      'darvas_box'   → darvas_box
+      'pullback'     → pullback_bounce
+      'all'          → all signals (default)
+
+    strength options:
+      'strong_buy'   → only _strong variants
+      'buy'          → only _buy variants
+      'multiple'     → stocks with 2+ signals
+      None           → all (default)
     """
     try:
-        since = (date.today() - timedelta(days=days)).isoformat()
-        limit = min(max(int(limit), 1), 100)
+        limit = min(max(int(limit), 1), 500)
 
-        # ── Resolve sector filter ───────────────────────────────
-        sector_tickers = None
+        # ── Step 1: Get latest date (same as dashboard) ─────────
+        latest_row = sb.table("entry_signals")                        .select("alert_date")                        .order("alert_date", desc=True)                        .limit(1)                        .execute().data
+
+        if not latest_row:
+            return json.dumps({"error": "No signals found"})
+
+        latest_date = latest_row[0]["alert_date"]
+
+        # ── Step 2: Fetch all signals for that date ─────────────
+        raw = sb.table("entry_signals")                 .select("ticker, stock_name, signal_type, signal_strength, price, alert_date, details")                 .eq("alert_date", latest_date)                 .order("signal_strength", desc=True)                 .limit(1000)                 .execute().data
+
+        if not raw:
+            return json.dumps({"error": f"No signals for {latest_date}"})
+
+        # ── Step 3: Filter by signal_type (mirrors dashboard tabs)
+        TYPE_MAP = {
+            "macd":         ["macd_buy", "macd_strong"],
+            "blue_zone":    ["blue_zone_buy", "blue_zone_strong"],
+            "golden_cross": ["golden_cross_buy", "golden_cross_strong"],
+            "narrow_cpr":   ["narrow_cpr_breakaway"],
+            "darvas_box":   ["darvas_box"],
+            "pullback":     ["pullback_bounce"],
+        }
+
+        if signal_type and signal_type.lower() != "all":
+            allowed = TYPE_MAP.get(signal_type.lower(), [signal_type.lower()])
+            raw = [s for s in raw if s["signal_type"] in allowed]
+
+        # ── Step 4: Filter by strength ──────────────────────────
+        if strength == "strong_buy":
+            raw = [s for s in raw if s["signal_type"].endswith("_strong")]
+        elif strength == "buy":
+            raw = [s for s in raw if s["signal_type"].endswith("_buy")]
+        elif strength == "multiple":
+            counts = {}
+            for s in raw:
+                counts[s["ticker"]] = counts.get(s["ticker"], 0) + 1
+            raw = [s for s in raw if counts[s["ticker"]] > 1]
+
+        # ── Step 5: Filter by sector ────────────────────────────
         if sector:
             sec_rows = sb.table("indian_stock_sectors")                          .select("ticker")                          .ilike("sector", f"%{sector}%")                          .execute().data
-            if sec_rows:
-                # indian_stock_sectors stores tickers without .NS
-                # entry_signals / market_alerts also store without .NS
-                sector_tickers = [r["ticker"] for r in sec_rows]
+            sec_tickers = {r["ticker"] for r in sec_rows}
+            if sec_tickers:
+                raw = [s for s in raw if s["ticker"] in sec_tickers]
 
-        # ── Query entry_signals ─────────────────────────────────
-        es_query = sb.table("entry_signals")                      .select("ticker, stock_name, signal_type, signal_strength, price, alert_date, details")                      .gte("alert_date", since)                      .gte("expires_at", date.today().isoformat())                      .order("alert_date", desc=True)                      .limit(limit)
-
-        if signal_type:
-            es_query = es_query.ilike("signal_type", f"%{signal_type}%")
-        if sector_tickers:
-            es_query = es_query.in_("ticker", sector_tickers)
-
-        entry_signals = es_query.execute().data
-
-        # ── Query market_alerts ─────────────────────────────────
-        ma_query = sb.table("market_alerts")                      .select("ticker, stock_name, alert_type, alert_category, alert_title, alert_description, price, alert_date")                      .gte("alert_date", since)                      .eq("archived", False)                      .order("alert_date", desc=True)                      .limit(limit)
-
-        if signal_type:
-            ma_query = ma_query.ilike("alert_type", f"%{signal_type}%")
-        if sector_tickers:
-            ma_query = ma_query.in_("ticker", sector_tickers)
-
-        market_alerts = ma_query.execute().data
-
-        # ── Enrich with sector where possible ──────────────────
-        all_tickers = list({
-            r["ticker"] for r in entry_signals + market_alerts
-        })
-        if all_tickers:
-            sec_map_rows = sb.table("indian_stock_sectors")                              .select("ticker, sector")                              .in_("ticker", all_tickers)                              .execute().data
-            sec_map = {r["ticker"]: r["sector"] for r in sec_map_rows}
-        else:
-            sec_map = {}
-
-        for r in entry_signals:
-            r["sector"] = sec_map.get(r["ticker"], "Unknown")
-        for r in market_alerts:
-            r["sector"] = sec_map.get(r["ticker"], "Unknown")
-
-        # ── Signal type summary ─────────────────────────────────
-        type_counts: dict = {}
-        for r in entry_signals:
-            st = r.get("signal_type", "unknown")
-            type_counts[st] = type_counts.get(st, 0) + 1
-        for r in market_alerts:
-            at = r.get("alert_type", "unknown")
-            type_counts[at] = type_counts.get(at, 0) + 1
+        # ── Step 6: Summary counts (mirrors dashboard Summary tab)
+        summary = {
+            "total":        len(raw),
+            "strong_buy":   sum(1 for s in raw if s["signal_type"].endswith("_strong")),
+            "buy":          sum(1 for s in raw if s["signal_type"].endswith("_buy")),
+            "macd":         sum(1 for s in raw if s["signal_type"].startswith("macd")),
+            "blue_zone":    sum(1 for s in raw if s["signal_type"].startswith("blue_zone")),
+            "golden_cross": sum(1 for s in raw if s["signal_type"].startswith("golden_cross")),
+            "narrow_cpr":   sum(1 for s in raw if s["signal_type"] == "narrow_cpr_breakaway"),
+            "darvas_box":   sum(1 for s in raw if s["signal_type"] == "darvas_box"),
+            "pullback":     sum(1 for s in raw if s["signal_type"] == "pullback_bounce"),
+        }
+        # stocks with 2+ signals
+        ticker_counts = {}
+        for s in raw:
+            ticker_counts[s["ticker"]] = ticker_counts.get(s["ticker"], 0) + 1
+        summary["multiple_signals"] = sum(1 for c in ticker_counts.values() if c > 1)
 
         return json.dumps({
+            "date":    latest_date,
+            "summary": summary,
+            "signals": raw[:limit],
             "filters": {
-                "sector":      sector,
                 "signal_type": signal_type,
-                "days":        days,
+                "strength":    strength,
+                "sector":      sector,
             },
-            "entry_signals":       entry_signals,
-            "market_alerts":       market_alerts,
-            "entry_signal_count":  len(entry_signals),
-            "market_alert_count":  len(market_alerts),
-            "signal_type_summary": type_counts,
         })
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
 
 # ─────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS (JSON schemas for Claude)
@@ -1613,32 +1636,32 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_market_signals",
         "description": (
-            "Query market-wide technical signals from the entry_signals and market_alerts tables. "
-            "Covers ALL stocks — not just your portfolio. "
-            "Use for questions like: 'any good entry signals this week?', "
-            "'show me pharma stocks with EMA breakouts', "
-            "'what are the strongest blue zone signals right now?', "
-            "'any banking stocks with golden cross?', "
-            "'what signals fired today in the market scanner?'"
+            "Query today's technical entry signals — mirrors the Technical Alerts tab exactly. "
+            "Always shows the latest date's signals. Covers ALL Nifty 500 stocks, not just portfolio. "
+            "Use for: 'what signals fired today?', 'show me MACD signals', "
+            "'any strong blue zone setups?', 'pharma stocks with golden cross', "
+            "'stocks with multiple signals today', 'best entry signals right now'"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "signal_type": {
+                    "type": "string",
+                    "description": "Filter by signal tab: 'macd', 'blue_zone', 'golden_cross', 'narrow_cpr', 'darvas_box', 'pullback', 'all'",
+                    "enum": ["all", "macd", "blue_zone", "golden_cross", "narrow_cpr", "darvas_box", "pullback"],
+                },
+                "strength": {
+                    "type": "string",
+                    "description": "Filter by strength: 'strong_buy' (only _strong signals), 'buy' (only _buy signals), 'multiple' (stocks with 2+ signals)",
+                    "enum": ["strong_buy", "buy", "multiple"],
+                },
                 "sector": {
                     "type": "string",
                     "description": "Optional sector filter e.g. 'Pharma', 'Banking', 'IT', 'Auto'",
                 },
-                "signal_type": {
-                    "type": "string",
-                    "description": "Optional signal type filter e.g. 'blue_zone', '200ema_breakout', 'golden_cross', 'volume_breakout', 'rsi'",
-                },
-                "days": {
-                    "type": "integer",
-                    "description": "Lookback window in days (default 7)",
-                },
                 "limit": {
                     "type": "integer",
-                    "description": "Max results per table (default 20, max 100)",
+                    "description": "Max signals to return (default 30, max 500)",
                 },
             },
             "required": [],
@@ -1690,10 +1713,10 @@ def execute_tool(name: str, params: dict) -> str:
         return analyze_decision(question=params.get("question", ""))
     elif name == "get_market_signals":
         return get_market_signals(
-            sector=params.get("sector"),
             signal_type=params.get("signal_type"),
-            days=params.get("days", 7),
-            limit=params.get("limit", 20),
+            strength=params.get("strength"),
+            sector=params.get("sector"),
+            limit=params.get("limit", 30),
         )
     else:
         return json.dumps({"error": f"Unknown tool: {name}"})

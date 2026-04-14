@@ -1311,6 +1311,94 @@ Your job:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+
+# ─────────────────────────────────────────────────────────────────
+# TOOL 13: get_market_signals
+# ─────────────────────────────────────────────────────────────────
+def get_market_signals(
+    sector:      str = None,
+    signal_type: str = None,
+    days:        int = 7,
+    limit:       int = 20,
+) -> str:
+    """
+    Query market-wide technical signals from entry_signals and market_alerts.
+    Covers stocks outside the portfolio too.
+    Optionally filter by sector (joins indian_stock_sectors) or signal type.
+    """
+    try:
+        since = (date.today() - timedelta(days=days)).isoformat()
+        limit = min(max(int(limit), 1), 100)
+
+        # ── Resolve sector filter ───────────────────────────────
+        sector_tickers = None
+        if sector:
+            sec_rows = sb.table("indian_stock_sectors")                          .select("ticker")                          .ilike("sector", f"%{sector}%")                          .execute().data
+            if sec_rows:
+                # indian_stock_sectors stores tickers without .NS
+                # entry_signals / market_alerts also store without .NS
+                sector_tickers = [r["ticker"] for r in sec_rows]
+
+        # ── Query entry_signals ─────────────────────────────────
+        es_query = sb.table("entry_signals")                      .select("ticker, stock_name, signal_type, signal_strength, price, alert_date, details")                      .gte("alert_date", since)                      .gte("expires_at", date.today().isoformat())                      .order("alert_date", desc=True)                      .limit(limit)
+
+        if signal_type:
+            es_query = es_query.ilike("signal_type", f"%{signal_type}%")
+        if sector_tickers:
+            es_query = es_query.in_("ticker", sector_tickers)
+
+        entry_signals = es_query.execute().data
+
+        # ── Query market_alerts ─────────────────────────────────
+        ma_query = sb.table("market_alerts")                      .select("ticker, stock_name, alert_type, alert_category, alert_title, alert_description, price, alert_date")                      .gte("alert_date", since)                      .eq("archived", False)                      .order("alert_date", desc=True)                      .limit(limit)
+
+        if signal_type:
+            ma_query = ma_query.ilike("alert_type", f"%{signal_type}%")
+        if sector_tickers:
+            ma_query = ma_query.in_("ticker", sector_tickers)
+
+        market_alerts = ma_query.execute().data
+
+        # ── Enrich with sector where possible ──────────────────
+        all_tickers = list({
+            r["ticker"] for r in entry_signals + market_alerts
+        })
+        if all_tickers:
+            sec_map_rows = sb.table("indian_stock_sectors")                              .select("ticker, sector")                              .in_("ticker", all_tickers)                              .execute().data
+            sec_map = {r["ticker"]: r["sector"] for r in sec_map_rows}
+        else:
+            sec_map = {}
+
+        for r in entry_signals:
+            r["sector"] = sec_map.get(r["ticker"], "Unknown")
+        for r in market_alerts:
+            r["sector"] = sec_map.get(r["ticker"], "Unknown")
+
+        # ── Signal type summary ─────────────────────────────────
+        type_counts: dict = {}
+        for r in entry_signals:
+            st = r.get("signal_type", "unknown")
+            type_counts[st] = type_counts.get(st, 0) + 1
+        for r in market_alerts:
+            at = r.get("alert_type", "unknown")
+            type_counts[at] = type_counts.get(at, 0) + 1
+
+        return json.dumps({
+            "filters": {
+                "sector":      sector,
+                "signal_type": signal_type,
+                "days":        days,
+            },
+            "entry_signals":       entry_signals,
+            "market_alerts":       market_alerts,
+            "entry_signal_count":  len(entry_signals),
+            "market_alert_count":  len(market_alerts),
+            "signal_type_summary": type_counts,
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 # ─────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS (JSON schemas for Claude)
 # ─────────────────────────────────────────────────────────────────
@@ -1522,6 +1610,40 @@ TOOL_DEFINITIONS = [
             "required": ["question"],
         },
     },
+    {
+        "name": "get_market_signals",
+        "description": (
+            "Query market-wide technical signals from the entry_signals and market_alerts tables. "
+            "Covers ALL stocks — not just your portfolio. "
+            "Use for questions like: 'any good entry signals this week?', "
+            "'show me pharma stocks with EMA breakouts', "
+            "'what are the strongest blue zone signals right now?', "
+            "'any banking stocks with golden cross?', "
+            "'what signals fired today in the market scanner?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sector": {
+                    "type": "string",
+                    "description": "Optional sector filter e.g. 'Pharma', 'Banking', 'IT', 'Auto'",
+                },
+                "signal_type": {
+                    "type": "string",
+                    "description": "Optional signal type filter e.g. 'blue_zone', '200ema_breakout', 'golden_cross', 'volume_breakout', 'rsi'",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window in days (default 7)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results per table (default 20, max 100)",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -1566,5 +1688,12 @@ def execute_tool(name: str, params: dict) -> str:
         )
     elif name == "analyze_decision":
         return analyze_decision(question=params.get("question", ""))
+    elif name == "get_market_signals":
+        return get_market_signals(
+            sector=params.get("sector"),
+            signal_type=params.get("signal_type"),
+            days=params.get("days", 7),
+            limit=params.get("limit", 20),
+        )
     else:
         return json.dumps({"error": f"Unknown tool: {name}"})
